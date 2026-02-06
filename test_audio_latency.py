@@ -5,6 +5,10 @@ xlib.XInitThreads()
 import socket
 hostname = socket.gethostname()
 
+import platform
+
+info = platform.freedesktop_os_release()
+
 import sys
 from pathlib import Path
 import csv
@@ -47,11 +51,13 @@ sounds = {
 kb = keyboard.Keyboard()
 
 for sound_name, mySound in sounds.items():
-    out_csv = OUT_DIR / f"audio_latency_{sound_name}_{hostname}.csv"
+    out_csv = OUT_DIR / f"audio_latency_{sound_name}_{hostname}_{info.get('NAME')}_{info.get('VERSION_ID')}.csv"
 
     with open(out_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
 
+        for key, value in info.items():
+            w.writerow([key, value])
         w.writerow(["audio_device_selected", selected_audio_device])
         w.writerow(["ptb_devices"])
         for dev in device_info:
