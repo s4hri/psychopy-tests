@@ -41,7 +41,7 @@ for d in ptb_devices:
 selected_audio_device = psychopy.prefs.hardware.get("audioDevice", "unknown")
 
 
-N_TRIALS = 51
+N_TRIALS = 101
 OUT_DIR = Path("./csv")
 
 sounds = {
@@ -58,8 +58,10 @@ for sound_name, mySound in sounds.items():
 
         for key, value in info.items():
             w.writerow([key, value])
+            if key == "VERSION":
+                break
         w.writerow(["audio_device_selected", selected_audio_device])
-        w.writerow(["ptb_devices"])
+        w.writerow(["ptb_devices",])
         for dev in device_info:
             w.writerow([dev])
         w.writerow([])
