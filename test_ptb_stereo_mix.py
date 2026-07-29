@@ -329,4 +329,35 @@ def main():
             fade_s=args.fade_secs,
         )
         total_secs_seq = args.d_secs + args.a_secs
-        ok_seq = play_ptb_buffer(pahandle, buf_seq, total_secs_seq, "Stereo sequential
+        ok_seq = play_ptb_buffer(pahandle, buf_seq, total_secs_seq, "Stereo sequential buffer")
+
+        # Simultaneous: both tones in their own channels
+        buf_mix = build_stereo_mix_buffer(
+            sr=sr,
+            d_hz=args.d_hz,
+            d_secs=args.d_secs,
+            a_hz=args.a_hz,
+            a_secs=args.a_secs,
+            fade_s=args.fade_secs,
+        )
+        total_secs_mix = max(args.d_secs, args.a_secs)
+        ok_mix = play_ptb_buffer(pahandle, buf_mix, total_secs_mix, "Stereo simultaneous buffer")
+
+        RESULTS["play_ok"] = ok_seq and ok_mix
+
+    except Exception as e:
+        print(f"Stereo mix test failed: {e}")
+        RESULTS["stream_open_ok"] = False
+        RESULTS["play_ok"] = False
+
+    finally:
+        section("Cleanup")
+        if pahandle is not None:
+            close_ptb_stream(pahandle)
+
+    print_summary()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
