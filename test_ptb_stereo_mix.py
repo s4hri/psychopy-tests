@@ -12,10 +12,15 @@ This is a qualitative test to verify:
 - left/right channel separation works (no overlap)
 - both channels can play simultaneously without crosstalk
 
+Device selection priority (when no explicit override given):
+  'default' (ALSA default PCM -> PulseAudio -> system-selected sink)
+  -> 'sysdefault' -> first device with >=2 output channels.
+Use --device-index / --device-name to override for diagnostics.
+
 Run:
     psychopy --direct test_ptb_stereo_mix.py
-    /opt/psychopy/PsychoPy-2025.1.1-Python3.10/.venv/lib/python3.10 test_ptb_stereo_mix.py --list-devices
-    /opt/psychopy/PsychoPy-2025.1.1-Python3.10/.venv/lib/python3.10 test_ptb_stereo_mix.py --device-index 1
+    /opt/psychopy/PsychoPy-2026.1.3-Python3.10/.venv/bin/python3 test_ptb_stereo_mix.py --list-devices
+    /opt/psychopy/PsychoPy-2026.1.3-Python3.10/.venv/bin/python3 test_ptb_stereo_mix.py --device-index 1
 
 Exit code: always 0.
 """
@@ -28,6 +33,11 @@ import platform
 from pprint import pformat
 
 RESULTS = {}
+
+# Preference order for automatic device selection (by DeviceName).
+# 'default' routes through PulseAudio and follows the system-selected sink.
+AUTO_NAME_PRIORITY = ("default", "sysdefault")
+
 
 def build_stereo_mix_buffer(sr: int, d_hz: float, d_secs: float, a_hz: float, a_secs: float, fade_s: float):
     """
@@ -49,6 +59,7 @@ def build_stereo_mix_buffer(sr: int, d_hz: float, d_secs: float, a_hz: float, a_
     if mx > 0:
         stereo *= 0.9 / mx
     return stereo
+
 
 def section(title: str):
     print("\n" + "=" * 70)
@@ -106,30 +117,60 @@ def ptb_print_devices(devices):
         print(f"- idx={idx} name='{name}' host='{host}' out={outch} in={inch} sr={sr}")
 
 
-def choose_output_device(devices, device_index_arg):
+def _device_fields(d):
+    """Extract (idx, name, sr, outch) from a PTB device dict, or None if no index."""
+    idx = d.get("DeviceIndex", d.get("deviceIndex", None))
+    if idx is None:
+        return None
+    name = d.get("DeviceName", d.get("deviceName", "unknown"))
+    sr = float(d.get("DefaultSampleRate", d.get("defaultSampleRate", 44100.0)))
+    outch = int(float(d.get("NrOutputChannels", d.get("nrOutputChannels", 2)) or 2))
+    return int(float(idx)), name, int(sr), outch
+
+
+def choose_output_device(devices, device_index_arg, device_name_arg):
+    """
+    Selection priority:
+      1) --device-index (explicit numeric override, for diagnostics)
+      2) --device-name  (explicit name override)
+      3) auto: first device whose DeviceName matches AUTO_NAME_PRIORITY,
+         in order ('default' first) -> follows system-selected sink via Pulse
+      4) fallback: first device with > 0 output channels
+    """
     if not devices:
         return None, None, None, None
 
+    # 1) explicit index override
     if device_index_arg is not None:
         for d in devices:
             idx = d.get("DeviceIndex", d.get("deviceIndex", None))
             if idx is not None and int(float(idx)) == int(device_index_arg):
-                name = d.get("DeviceName", d.get("deviceName", "unknown"))
-                sr = float(d.get("DefaultSampleRate", d.get("defaultSampleRate", 44100.0)))
-                outch = int(float(d.get("NrOutputChannels", d.get("nrOutputChannels", 2)) or 2))
-                return int(device_index_arg), name, int(sr), outch
+                return _device_fields(d)
         print(f"WARNING: --device-index {device_index_arg} not found; falling back to auto selection.")
 
-    # auto: first device with output channels
+    # 2) explicit name override
+    if device_name_arg is not None:
+        for d in devices:
+            name = d.get("DeviceName", d.get("deviceName", None))
+            if name == device_name_arg:
+                return _device_fields(d)
+        print(f"WARNING: --device-name '{device_name_arg}' not found; falling back to auto selection.")
+
+    # 3) auto by name priority (prefer 'default' -> Pulse -> system sink)
+    for wanted in AUTO_NAME_PRIORITY:
+        for d in devices:
+            name = d.get("DeviceName", d.get("deviceName", None))
+            outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
+            if name == wanted and outch and float(outch) > 0:
+                return _device_fields(d)
+
+    # 4) fallback: first device with output channels
     for d in devices:
         outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
         if outch and float(outch) > 0:
-            idx = d.get("DeviceIndex", d.get("deviceIndex", None))
-            if idx is None:
-                continue
-            name = d.get("DeviceName", d.get("deviceName", "unknown"))
-            sr = float(d.get("DefaultSampleRate", d.get("defaultSampleRate", 44100.0)))
-            return int(float(idx)), name, int(sr), int(float(outch))
+            fields = _device_fields(d)
+            if fields is not None:
+                return fields
 
     return None, None, None, None
 
@@ -150,30 +191,11 @@ def make_tone(freq_hz: float, dur_s: float, sr: int, fade_s: float):
 
 
 def build_stereo_buffer(sr: int, d_hz: float, d_secs: float, a_hz: float, a_secs: float, fade_s: float):
-    def build_stereo_mix_buffer(sr: int, d_hz: float, d_secs: float, a_hz: float, a_secs: float, fade_s: float):
-        """
-        Return bufferdata shaped (numSamples, 2) where:
-        - left contains D tone for d_secs
-        - right contains A tone for a_secs
-        Both start at t=0, duration = max(d_secs, a_secs)
-        """
-        import numpy as np
-        n = int(round(max(d_secs, a_secs) * sr))
-        left = np.zeros(n, dtype=np.float32)
-        right = np.zeros(n, dtype=np.float32)
-        d = make_tone(d_hz, d_secs, sr, fade_s)
-        a = make_tone(a_hz, a_secs, sr, fade_s)
-        left[:len(d)] = d
-        right[:len(a)] = a
-        stereo = np.stack([left, right], axis=1)
-        mx = float(np.max(np.abs(stereo)))
-        if mx > 0:
-            stereo *= 0.9 / mx
-        return stereo
     """
     Return bufferdata shaped (numSamples, 2) where:
     - left contains D tone for d_secs, right is silent
     - then right contains A tone for a_secs, left is silent
+    (Sequential: left segment followed by right segment.)
     """
     import numpy as np
 
@@ -243,6 +265,7 @@ def main():
     ap.add_argument("--list-devices", action="store_true", help="list PTB devices and exit")
     ap.add_argument("--verbose", action="store_true", help="verbose PTB device info")
     ap.add_argument("--device-index", type=int, default=None, help="PTB DeviceIndex to use (from GetDevices)")
+    ap.add_argument("--device-name", type=str, default=None, help="PTB DeviceName to use (e.g. 'default')")
     ap.add_argument("--latency-class", type=int, default=1, help="PTB latency class (default 1)")
     ap.add_argument("--fade-secs", type=float, default=0.01, help="fade in/out seconds (default 0.01)")
     ap.add_argument("--d-hz", type=float, default=293.66, help="Left channel D tone frequency (default D4 ~293.66)")
@@ -260,7 +283,9 @@ def main():
         return 0
 
     section("Device selection")
-    dev_idx, dev_name, dev_sr, dev_outch = choose_output_device(devices, args.device_index)
+    dev_idx, dev_name, dev_sr, dev_outch = choose_output_device(
+        devices, args.device_index, args.device_name
+    )
     if dev_idx is None:
         print("ERROR: could not select an output device.")
         print_summary()
@@ -273,6 +298,8 @@ def main():
         return 0
 
     sr = int(dev_sr) if dev_sr else 44100
+    # This test is specifically about L/R separation, so we always open 2
+    # channels regardless of PTB_MAX_OUT_CHANNELS.
     channels = 2
     print(f"Selected device: idx={dev_idx}, name='{dev_name}', defaultSR={dev_sr}, outCh={dev_outch}")
     print(f"Using sample rate: {sr} Hz")
@@ -302,35 +329,4 @@ def main():
             fade_s=args.fade_secs,
         )
         total_secs_seq = args.d_secs + args.a_secs
-        ok_seq = play_ptb_buffer(pahandle, buf_seq, total_secs_seq, "Stereo sequential buffer")
-
-        # Simultaneous: both tones in their own channels
-        buf_mix = build_stereo_mix_buffer(
-            sr=sr,
-            d_hz=args.d_hz,
-            d_secs=args.d_secs,
-            a_hz=args.a_hz,
-            a_secs=args.a_secs,
-            fade_s=args.fade_secs,
-        )
-        total_secs_mix = max(args.d_secs, args.a_secs)
-        ok_mix = play_ptb_buffer(pahandle, buf_mix, total_secs_mix, "Stereo simultaneous buffer")
-
-        RESULTS["play_ok"] = ok_seq and ok_mix
-
-    except Exception as e:
-        print(f"Stereo mix test failed: {e}")
-        RESULTS["stream_open_ok"] = False
-        RESULTS["play_ok"] = False
-
-    finally:
-        section("Cleanup")
-        if pahandle is not None:
-            close_ptb_stream(pahandle)
-
-    print_summary()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        ok_seq = play_ptb_buffer(pahandle, buf_seq, total_secs_seq, "Stereo sequential
