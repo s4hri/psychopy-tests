@@ -4,17 +4,27 @@ PTB (Psychtoolbox) audio-only diagnostic — SINGLE BEEP
 
 Steps:
 1) Print PTB config + device list.
-2) Select output device (auto or --device-index).
+2) Select output device (auto by name, or --device-index / --device-name).
 3) Open ONE PTB output stream.
 4) FillBuffer with correct shape (numSamples, numChannels).
 5) Play beep (default 440 Hz, 1.0 s).
 6) Close stream + summary.
 
+Device selection priority (when no explicit override given):
+  'default' (ALSA default PCM -> PulseAudio -> system-selected sink)
+  -> 'sysdefault' -> first device with output channels.
+This mirrors the patched SpeakerDevice behaviour so the test follows the
+same output as real experiments. Use --device-index / --device-name to
+override for diagnostics (e.g. probing a raw hw: device).
+
+Channel count is clamped by PTB_MAX_OUT_CHANNELS (if set), matching the
+SpeakerDevice patch, so 128-channel ALSA PCMs open as stereo.
+
 Exit code: always 0 (qualitative test).
 
 Run:
   psychopy --direct test_ptb_single.py
-  /opt/psychopy/PsychoPy-2025.1.1-Python3.10/.venv/bin/python3 test_ptb_single.py --verbose
+  /opt/psychopy/PsychoPy-2026.1.3-Python3.10/.venv/bin/python3 test_ptb_single.py --verbose
 """
 
 import argparse
@@ -25,6 +35,10 @@ import platform
 from pprint import pformat
 
 RESULTS = {}
+
+# Preference order for automatic device selection (by DeviceName).
+# 'default' routes through PulseAudio and follows the system-selected sink.
+AUTO_NAME_PRIORITY = ("default", "sysdefault")
 
 
 def section(title: str):
@@ -90,32 +104,75 @@ def ptb_info(verbose: bool):
     return devices
 
 
-def choose_output_device(devices, device_index_arg):
+def _device_fields(d):
+    """Extract (idx, name, sr, outch) from a PTB device dict, or None if no index."""
+    idx = d.get("DeviceIndex", d.get("deviceIndex", None))
+    if idx is None:
+        return None
+    name = d.get("DeviceName", d.get("deviceName", "unknown"))
+    sr = float(d.get("DefaultSampleRate", d.get("defaultSampleRate", 44100.0)))
+    outch = int(float(d.get("NrOutputChannels", d.get("nrOutputChannels", 2)) or 2))
+    return int(idx), name, sr, outch
+
+
+def choose_output_device(devices, device_index_arg, device_name_arg):
+    """
+    Selection priority:
+      1) --device-index (explicit numeric override, for diagnostics)
+      2) --device-name  (explicit name override)
+      3) auto: first device whose DeviceName matches AUTO_NAME_PRIORITY,
+         in order ('default' first) -> follows system-selected sink via Pulse
+      4) fallback: first device with > 0 output channels
+    """
     if not devices:
         return None, None, None, None
 
+    # 1) explicit index override
     if device_index_arg is not None:
         for d in devices:
             idx = d.get("DeviceIndex", d.get("deviceIndex", None))
             if idx is not None and int(idx) == int(device_index_arg):
-                name = d.get("DeviceName", d.get("deviceName", "unknown"))
-                sr = float(d.get("DefaultSampleRate", d.get("defaultSampleRate", 44100.0)))
-                outch = int(float(d.get("NrOutputChannels", d.get("nrOutputChannels", 2)) or 2))
-                return int(idx), name, sr, outch
+                return _device_fields(d)
         print(f"WARNING: --device-index {device_index_arg} not found; falling back to auto selection.")
 
+    # 2) explicit name override
+    if device_name_arg is not None:
+        for d in devices:
+            name = d.get("DeviceName", d.get("deviceName", None))
+            if name == device_name_arg:
+                return _device_fields(d)
+        print(f"WARNING: --device-name '{device_name_arg}' not found; falling back to auto selection.")
+
+    # 3) auto by name priority (prefer 'default' -> Pulse -> system sink)
+    for wanted in AUTO_NAME_PRIORITY:
+        for d in devices:
+            name = d.get("DeviceName", d.get("deviceName", None))
+            outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
+            if name == wanted and outch and float(outch) > 0:
+                return _device_fields(d)
+
+    # 4) fallback: first device with output channels
     for d in devices:
         outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
         if outch and float(outch) > 0:
-            idx = d.get("DeviceIndex", d.get("deviceIndex", None))
-            if idx is None:
-                continue
-            name = d.get("DeviceName", d.get("deviceName", "unknown"))
-            sr = float(d.get("DefaultSampleRate", d.get("defaultSampleRate", 44100.0)))
-            outch_i = int(float(outch))
-            return int(idx), name, sr, outch_i
+            fields = _device_fields(d)
+            if fields is not None:
+                return fields
 
     return None, None, None, None
+
+
+def clamp_channels(dev_outch):
+    """
+    Clamp output channels by PTB_MAX_OUT_CHANNELS (if set), mirroring the
+    SpeakerDevice patch. ALSA 'default'/'sysdefault' advertise 128 channels;
+    with PTB_MAX_OUT_CHANNELS=2 this opens them as stereo.
+    """
+    dev_out = int(dev_outch)
+    max_out = int(os.environ.get("PTB_MAX_OUT_CHANNELS", dev_out))
+    if max_out > 0:
+        return max(1, min(dev_out, max_out))
+    return max(1, dev_out)
 
 
 def make_tone(freq_hz: float, dur_s: float, sr: int, fade_s: float):
@@ -189,6 +246,7 @@ def main():
     ap = argparse.ArgumentParser(description="PTB audio-only diagnostic — single beep")
     ap.add_argument("--verbose", action="store_true", help="print verbose PTB device/config info")
     ap.add_argument("--device-index", type=int, default=None, help="PTB DeviceIndex to use (from GetDevices)")
+    ap.add_argument("--device-name", type=str, default=None, help="PTB DeviceName to use (e.g. 'default')")
     ap.add_argument("--sr", type=int, default=0, help="sample rate override (0 = device default)")
     ap.add_argument("--latency-class", type=int, default=1, help="PTB latency class (default 1)")
     ap.add_argument("--fade-secs", type=float, default=0.01, help="fade in/out seconds (default 0.01)")
@@ -200,14 +258,16 @@ def main():
     devices = ptb_info(verbose=args.verbose)
 
     section("3) Device selection")
-    dev_idx, dev_name, dev_sr, dev_outch = choose_output_device(devices, args.device_index)
+    dev_idx, dev_name, dev_sr, dev_outch = choose_output_device(
+        devices, args.device_index, args.device_name
+    )
     if dev_idx is None:
         print("ERROR: could not select an output device from PTB list.")
         print_summary()
         return 0
 
     sr = args.sr if args.sr and args.sr > 0 else int(dev_sr) if dev_sr else 44100
-    channels = max(1, int(dev_outch))  # match device out channels
+    channels = clamp_channels(dev_outch)  # match device out channels, clamped
     print(f"Selected device: idx={dev_idx}, name='{dev_name}', defaultSR={dev_sr}, outCh={dev_outch}")
     print(f"Using sample rate: {sr} Hz")
     print(f"Using channels   : {channels}")
