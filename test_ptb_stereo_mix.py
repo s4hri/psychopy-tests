@@ -12,10 +12,14 @@ This is a qualitative test to verify:
 - left/right channel separation works (no overlap)
 - both channels can play simultaneously without crosstalk
 
-Device selection priority (when no explicit override given):
-  'default' (ALSA default PCM -> PulseAudio -> system-selected sink)
-  -> 'sysdefault' -> first device with >=2 output channels.
-Use --device-index / --device-name to override for diagnostics.
+Device selection (auto, when no explicit override given), first match wins:
+  1) a device named 'default'    (ALSA default PCM -> Pulse -> system sink)
+  2) a device named 'sysdefault'
+  3) the first analog hw: output, excluding HDMI / NVIDIA
+  4) the first device with output channels
+This mirrors the patched SpeakerDevice, so the test follows the same output
+as real experiments with no per-host configuration. Use --device-index /
+--device-name to override for diagnostics.
 
 Run:
     psychopy --direct test_ptb_stereo_mix.py
@@ -33,10 +37,6 @@ import platform
 from pprint import pformat
 
 RESULTS = {}
-
-# Preference order for automatic device selection (by DeviceName).
-# 'default' routes through PulseAudio and follows the system-selected sink.
-AUTO_NAME_PRIORITY = ("default", "sysdefault")
 
 
 def build_stereo_mix_buffer(sr: int, d_hz: float, d_secs: float, a_hz: float, a_secs: float, fade_s: float):
@@ -128,14 +128,43 @@ def _device_fields(d):
     return int(float(idx)), name, int(sr), outch
 
 
+def _outch(d):
+    return float(d.get("NrOutputChannels", d.get("nrOutputChannels", 0)) or 0)
+
+
+def _dname(d):
+    return d.get("DeviceName", d.get("deviceName", "")) or ""
+
+
+def _auto_select(devices):
+    """Policy-based auto selection, mirroring the patched SpeakerDevice:
+      1) 'default'  2) 'sysdefault'  3) first analog hw: (non-HDMI/NVIDIA)
+      4) first device with output channels.
+    Returns the chosen device dict, or None.
+    """
+    outs = [d for d in devices if _outch(d) > 0]
+    if not outs:
+        return None
+    for d in outs:
+        if _dname(d) == "default":
+            return d
+    for d in outs:
+        if _dname(d) == "sysdefault":
+            return d
+    for d in outs:
+        n = _dname(d)
+        if "Analog" in n and "HDMI" not in n and "NVidia" not in n and "NVIDIA" not in n:
+            return d
+    return outs[0]
+
+
 def choose_output_device(devices, device_index_arg, device_name_arg):
     """
     Selection priority:
       1) --device-index (explicit numeric override, for diagnostics)
       2) --device-name  (explicit name override)
-      3) auto: first device whose DeviceName matches AUTO_NAME_PRIORITY,
-         in order ('default' first) -> follows system-selected sink via Pulse
-      4) fallback: first device with > 0 output channels
+      3) auto by policy (see _auto_select): 'default' -> 'sysdefault' ->
+         analog hw: -> first output device
     """
     if not devices:
         return None, None, None, None
@@ -151,26 +180,14 @@ def choose_output_device(devices, device_index_arg, device_name_arg):
     # 2) explicit name override
     if device_name_arg is not None:
         for d in devices:
-            name = d.get("DeviceName", d.get("deviceName", None))
-            if name == device_name_arg:
+            if _dname(d) == device_name_arg:
                 return _device_fields(d)
         print(f"WARNING: --device-name '{device_name_arg}' not found; falling back to auto selection.")
 
-    # 3) auto by name priority (prefer 'default' -> Pulse -> system sink)
-    for wanted in AUTO_NAME_PRIORITY:
-        for d in devices:
-            name = d.get("DeviceName", d.get("deviceName", None))
-            outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
-            if name == wanted and outch and float(outch) > 0:
-                return _device_fields(d)
-
-    # 4) fallback: first device with output channels
-    for d in devices:
-        outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
-        if outch and float(outch) > 0:
-            fields = _device_fields(d)
-            if fields is not None:
-                return fields
+    # 3) auto by policy
+    chosen = _auto_select(devices)
+    if chosen is not None:
+        return _device_fields(chosen)
 
     return None, None, None, None
 
