@@ -4,26 +4,24 @@ PTB (Psychtoolbox) audio-only diagnostic — SINGLE BEEP
 
 Steps:
 1) Print PTB config + device list.
-2) Select output device (--device-index / --device-name / PSYCHOPY_AUDIO_DEVICE / auto).
+2) Select output device (auto by policy, or --device-index / --device-name).
 3) Open ONE PTB output stream.
 4) FillBuffer with correct shape (numSamples, numChannels).
 5) Play beep (default 440 Hz, 1.0 s).
 6) Close stream + summary.
 
-Device selection priority (first match wins):
-  1) --device-index (explicit numeric override, for diagnostics)
-  2) --device-name  (explicit selector: exact name or hw token)
-  3) PSYCHOPY_AUDIO_DEVICE env var (per-host selector: exact name or hw token)
-  4) auto: 'default' -> 'sysdefault' -> first device with output channels
+Device selection (auto, when no explicit override given), first match wins:
+  1) a device named 'default'    (ALSA default PCM -> Pulse -> system sink)
+  2) a device named 'sysdefault'
+  3) the first analog hw: output, excluding HDMI / NVIDIA (the real onboard
+     output on machines where 'default' is not enumerated, e.g. NVIDIA boxes)
+  4) the first device with output channels
+This mirrors the patched SpeakerDevice, so the test follows the same output
+as real experiments with no per-host configuration. Use --device-index /
+--device-name to override for diagnostics (e.g. probing a raw hw: device).
 
-The selector may be an exact PTB DeviceName (e.g. 'default') or an ALSA hw
-token (e.g. 'hw:2,0'), which PortAudio embeds verbatim in raw-device names.
-This mirrors the patched SpeakerDevice so the test follows the same output
-as real experiments. PSYCHOPY_AUDIO_DEVICE is typically set per host from
-`aplay -l` (see README).
-
-Channel count is clamped by PTB_MAX_OUT_CHANNELS (if set), matching the
-SpeakerDevice patch, so 128-channel ALSA PCMs open as stereo.
+Channel count defaults to stereo (2); override with PTB_MAX_OUT_CHANNELS so
+128-channel ALSA PCMs don't cause a FillBuffer channel mismatch.
 
 Exit code: always 0 (qualitative test).
 
@@ -41,10 +39,6 @@ from pprint import pformat
 
 RESULTS = {}
 
-# Preference order for automatic device selection (by DeviceName).
-# 'default' routes through PulseAudio and follows the system-selected sink.
-AUTO_NAME_PRIORITY = ("default", "sysdefault")
-
 
 def section(title: str):
     print("\n" + "=" * 70)
@@ -57,10 +51,10 @@ def env_info():
     print(f"Python   : {platform.python_version()} ({sys.executable})")
     print(f"Platform : {platform.platform()}")
     print(f"User/UID : {os.getenv('USER', 'unknown')} / {os.getuid()}")
-    for k in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "PIPEWIRE_REMOTE", "PSYCHOPY_AUDIO_DEVICE"]:
+    for k in ["DISPLAY", "WAYLAND_DISPLAY", "PULSE_SERVER", "PIPEWIRE_REMOTE"]:
         v = os.environ.get(k)
         if v:
-            print(f"{k:20}: {v}")
+            print(f"{k:14}: {v}")
 
 
 def ptb_info(verbose: bool):
@@ -120,44 +114,43 @@ def _device_fields(d):
     return int(float(idx)), name, sr, outch
 
 
-def _name_matches(profile_name, wanted):
-    """True if a PTB DeviceName matches a selector.
+def _outch(d):
+    return float(d.get("NrOutputChannels", d.get("nrOutputChannels", 0)) or 0)
 
-    `wanted` may be an exact DeviceName ('default', 'sysdefault', or a full
-    'HDA Intel PCH: ALC623 Analog (hw:2,0)') or an ALSA hw token ('hw:2,0' /
-    '(hw:2,0)') which PortAudio embeds verbatim in raw-device names.
+
+def _dname(d):
+    return d.get("DeviceName", d.get("deviceName", "")) or ""
+
+
+def _auto_select(devices):
+    """Policy-based auto selection, mirroring the patched SpeakerDevice:
+      1) 'default'  2) 'sysdefault'  3) first analog hw: (non-HDMI/NVIDIA)
+      4) first device with output channels.
+    Returns the chosen device dict, or None.
     """
-    if not wanted:
-        return False
-    if profile_name == wanted:
-        return True
-    if wanted.startswith("hw:") and "({})".format(wanted) in profile_name:
-        return True
-    if wanted.startswith("(hw:") and wanted in profile_name:
-        return True
-    return False
-
-
-def _find_by_selector(devices, selector):
-    """Return _device_fields for the first output-capable device matching
-    `selector` (exact name or hw token), or None."""
-    for d in devices:
-        name = d.get("DeviceName", d.get("deviceName", "")) or ""
-        outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
-        if _name_matches(name, selector) and outch and float(outch) > 0:
-            return _device_fields(d)
-    return None
+    outs = [d for d in devices if _outch(d) > 0]
+    if not outs:
+        return None
+    for d in outs:
+        if _dname(d) == "default":
+            return d
+    for d in outs:
+        if _dname(d) == "sysdefault":
+            return d
+    for d in outs:
+        n = _dname(d)
+        if "Analog" in n and "HDMI" not in n and "NVidia" not in n and "NVIDIA" not in n:
+            return d
+    return outs[0]
 
 
 def choose_output_device(devices, device_index_arg, device_name_arg):
     """
     Selection priority:
       1) --device-index (explicit numeric override, for diagnostics)
-      2) --device-name, else PSYCHOPY_AUDIO_DEVICE env var
-         (exact DeviceName or ALSA hw token, e.g. 'default' or 'hw:2,0')
-      3) auto: first device whose DeviceName matches AUTO_NAME_PRIORITY,
-         in order ('default' first) -> follows system-selected sink via Pulse
-      4) fallback: first device with > 0 output channels
+      2) --device-name  (explicit name override)
+      3) auto by policy (see _auto_select): 'default' -> 'sysdefault' ->
+         analog hw: -> first output device
     """
     if not devices:
         return None, None, None, None
@@ -170,41 +163,30 @@ def choose_output_device(devices, device_index_arg, device_name_arg):
                 return _device_fields(d)
         print(f"WARNING: --device-index {device_index_arg} not found; falling back to auto selection.")
 
-    # 2) explicit --device-name, else per-host PSYCHOPY_AUDIO_DEVICE env var
-    selector = device_name_arg or os.environ.get("PSYCHOPY_AUDIO_DEVICE", "").strip() or None
-    if selector:
-        fields = _find_by_selector(devices, selector)
-        if fields is not None:
-            return fields
-        print(f"WARNING: device selector '{selector}' not found; falling back to auto selection.")
-
-    # 3) auto by name priority (prefer 'default' -> Pulse -> system sink)
-    for wanted in AUTO_NAME_PRIORITY:
+    # 2) explicit name override
+    if device_name_arg is not None:
         for d in devices:
-            name = d.get("DeviceName", d.get("deviceName", None))
-            outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
-            if name == wanted and outch and float(outch) > 0:
+            if _dname(d) == device_name_arg:
                 return _device_fields(d)
+        print(f"WARNING: --device-name '{device_name_arg}' not found; falling back to auto selection.")
 
-    # 4) fallback: first device with output channels
-    for d in devices:
-        outch = d.get("NrOutputChannels", d.get("nrOutputChannels", 0))
-        if outch and float(outch) > 0:
-            fields = _device_fields(d)
-            if fields is not None:
-                return fields
+    # 3) auto by policy
+    chosen = _auto_select(devices)
+    if chosen is not None:
+        return _device_fields(chosen)
 
     return None, None, None, None
 
 
 def clamp_channels(dev_outch):
     """
-    Clamp output channels by PTB_MAX_OUT_CHANNELS (if set), mirroring the
-    SpeakerDevice patch. ALSA 'default'/'sysdefault' advertise 128 channels;
-    with PTB_MAX_OUT_CHANNELS=2 this opens them as stereo.
+    Clamp output channels to stereo by default (mirrors the SpeakerDevice
+    patch). Many ALSA 'default'/'sysdefault' PCMs advertise 128 channels,
+    which mismatches stereo buffers (PTB FillBuffer error). Override with
+    PTB_MAX_OUT_CHANNELS if a node genuinely needs more channels.
     """
     dev_out = int(dev_outch)
-    max_out = int(os.environ.get("PTB_MAX_OUT_CHANNELS", dev_out))
+    max_out = int(os.environ.get("PTB_MAX_OUT_CHANNELS", 2))
     if max_out > 0:
         return max(1, min(dev_out, max_out))
     return max(1, dev_out)
@@ -281,8 +263,7 @@ def main():
     ap = argparse.ArgumentParser(description="PTB audio-only diagnostic — single beep")
     ap.add_argument("--verbose", action="store_true", help="print verbose PTB device/config info")
     ap.add_argument("--device-index", type=int, default=None, help="PTB DeviceIndex to use (from GetDevices)")
-    ap.add_argument("--device-name", type=str, default=None,
-                    help="PTB device selector: exact DeviceName (e.g. 'default') or hw token (e.g. 'hw:2,0')")
+    ap.add_argument("--device-name", type=str, default=None, help="PTB DeviceName to use (e.g. 'default')")
     ap.add_argument("--sr", type=int, default=0, help="sample rate override (0 = device default)")
     ap.add_argument("--latency-class", type=int, default=1, help="PTB latency class (default 1)")
     ap.add_argument("--fade-secs", type=float, default=0.01, help="fade in/out seconds (default 0.01)")
