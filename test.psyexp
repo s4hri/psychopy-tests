@@ -70,7 +70,7 @@
         <Param val="False" valType="bool" updates="None" name="useWindowParams"/>
       </RoutineSettingsComponent>
       <SoundComponent name="sound_1" plugin="None">
-        <Param val="default" valType="device" updates="None" name="deviceLabel"/>
+        <Param val="defaultSpeaker" valType="device" updates="None" name="deviceLabel"/>
         <Param val="False" valType="bool" updates="None" name="disabled"/>
         <Param val="" valType="code" updates="None" name="durationEstim"/>
         <Param val="False" valType="bool" updates="constant" name="forceEndRoutine"/>
@@ -182,7 +182,7 @@
         <Param val="False" valType="bool" updates="None" name="useWindowParams"/>
       </RoutineSettingsComponent>
       <SoundComponent name="sound_2" plugin="None">
-        <Param val="default" valType="device" updates="None" name="deviceLabel"/>
+        <Param val="defaultSpeaker" valType="device" updates="None" name="deviceLabel"/>
         <Param val="False" valType="bool" updates="None" name="disabled"/>
         <Param val="" valType="code" updates="None" name="durationEstim"/>
         <Param val="False" valType="bool" updates="constant" name="forceEndRoutine"/>
